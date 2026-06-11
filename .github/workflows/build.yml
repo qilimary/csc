@@ -19,22 +19,52 @@ jobs:
         java-version: '11'
         distribution: 'temurin'
 
-    - name: Download and Unzip Your Model
+    - name: Download Model and Extract Vocab
       run: |
-        pipx run gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
+        # 1. 安装下载工具和官方 sentencepiece 库
+        pip install gdown sentencepiece
+        
+        # 2. 下载你的云盘模型
+        gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
         unzip -j -o model.zip
+        
+        # 3. 核心魔法：用 Python 把 spm.model 转成 Android 可直接读取的 JSON，丢弃麻烦的 C++ 库
+        cat << 'EOF' > convert_vocab.py
+        import sentencepiece as spm
+        import json
+        
+        sp = spm.SentencePieceProcessor(model_file='spm.model')
+        vocab = {}
+        id2char = {}
+        
+        for i in range(sp.get_piece_size()):
+            piece = sp.id_to_piece(i)
+            clean_piece = piece.replace(' ', '') # 移除 SPM 特有的下划线标记
+            
+            vocab[piece] = i
+            if clean_piece and clean_piece not in vocab:
+                vocab[clean_piece] = i
+                
+            id2char[i] = clean_piece if clean_piece else piece
+            
+        with open('vocab.json', 'w', encoding='utf-8') as f:
+            json.dump(vocab, f, ensure_ascii=False)
+        with open('id2char.json', 'w', encoding='utf-8') as f:
+            json.dump(id2char, f, ensure_ascii=False)
+        EOF
+        python convert_vocab.py
 
-    - name: Scaffold Android Project (Simplified)
+    - name: Scaffold Android Project (Ultra Stable)
       run: |
         mkdir -p app/src/main/java/com/example/csc
         mkdir -p app/src/main/res/layout
-        mkdir -p app/src/main/res/values
         mkdir -p app/src/main/assets
         mkdir -p gradle/wrapper
 
-        # 拷贝你的模型文件到手机资源库
-        cp qideberta_csc_traced.pt app/src/main/assets/ || true
-        cp spm.model app/src/main/assets/ || true
+        # 拷贝模型和我们刚生成的 JSON 词表到 assets
+        cp qideberta_csc_traced.pt app/src/main/assets/
+        cp vocab.json app/src/main/assets/
+        cp id2char.json app/src/main/assets/
 
         cat << 'EOF' > gradle.properties
         android.useAndroidX=true
@@ -47,7 +77,7 @@ jobs:
             repositories { google(); mavenCentral() }
             dependencies { classpath "com.android.tools.build:gradle:7.4.2" }
         }
-        # 彻底移除 JitPack，只保留绝对可靠的官方镜像源
+        // 彻底移除不可靠的第三方库，仅使用谷歌和 Maven 官方中央仓库
         allprojects { repositories { google(); mavenCentral() } }
         EOF
 
@@ -71,16 +101,14 @@ jobs:
                 targetCompatibility JavaVersion.VERSION_11
             }
             aaptOptions {
-                noCompress "pt", "model"
+                noCompress "pt"
             }
         }
         dependencies {
             implementation 'androidx.appcompat:appcompat:1.6.1'
             implementation 'com.google.android.material:material:1.8.0'
             implementation 'org.pytorch:pytorch_android_lite:1.13.0'
-            
-            # 使用全新的纯 Java 版 SentencePiece4J (绝对可用)
-            implementation 'io.github.eix128:sentencepiece4j:1.0.2'
+            // 没有第三方分词库了，告别下载失败！
         }
         EOF
 
@@ -145,20 +173,19 @@ jobs:
         import android.widget.*;
         import org.pytorch.*;
         import java.io.*;
+        import java.nio.charset.StandardCharsets;
         import java.util.Locale;
-        import java.util.List;
-        import java.util.Arrays;
-        import java.nio.file.Paths;
-
-        // 引入全新的纯 Java 版 SentencePiece
-        import com.sentencepiece.Model;
-        import com.sentencepiece.SentencePieceAlgorithm;
-        import com.sentencepiece.Scoring;
+        import java.util.Map;
+        import java.util.HashMap;
+        import org.json.JSONObject;
+        import java.util.Iterator;
 
         public class MainActivity extends Activity {
             private Module module = null;
-            private Model spProcessor = null;
-            private SentencePieceAlgorithm algorithm = null;
+            private Map<String, Long> charToId = new HashMap<>();
+            private Map<Long, String> idToChar = new HashMap<>();
+            private long clsId = 1, sepId = 2, unkId = 0;
+            
             private EditText etInput;
             private Button btnCorrect;
             private TextView tvResult, tvTemp, tvThreshold;
@@ -186,10 +213,12 @@ jobs:
                         String modelPath = assetFilePath(this, "qideberta_csc_traced.pt");
                         module = LiteModuleLoader.load(modelPath);
                         
-                        String spmPath = assetFilePath(this, "spm.model");
-                        spProcessor = Model.parseFrom(Paths.get(spmPath));
-                        algorithm = new SentencePieceAlgorithm(true, Scoring.HIGHEST_SCORE);
+                        loadVocabMaps();
                         
+                        clsId = charToId.containsKey("[CLS]") ? charToId.get("[CLS]") : charToId.getOrDefault("<s>", 1L);
+                        sepId = charToId.containsKey("[SEP]") ? charToId.get("[SEP]") : charToId.getOrDefault("</s>", 2L);
+                        unkId = charToId.containsKey("[UNK]") ? charToId.get("[UNK]") : charToId.getOrDefault("<unk>", 0L);
+
                         runOnUiThread(() -> {
                             tvResult.setText("模型加载完毕，请输入文字！");
                             Toast.makeText(MainActivity.this, "加载成功", Toast.LENGTH_SHORT).show();
@@ -202,9 +231,33 @@ jobs:
 
                 btnCorrect.setOnClickListener(v -> {
                     String text = etInput.getText().toString();
-                    if (text.isEmpty() || module == null || spProcessor == null) return;
+                    if (text.isEmpty() || module == null || charToId.isEmpty()) return;
                     runInference(text);
                 });
+            }
+
+            private void loadVocabMaps() throws Exception {
+                // 读取 vocab.json
+                InputStream is = getAssets().open("vocab.json");
+                byte[] buffer = new byte[is.available()];
+                is.read(buffer); is.close();
+                JSONObject json = new JSONObject(new String(buffer, StandardCharsets.UTF_8));
+                Iterator<String> keys = json.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    charToId.put(key, (long) json.getInt(key));
+                }
+
+                // 读取 id2char.json
+                InputStream is2 = getAssets().open("id2char.json");
+                byte[] buffer2 = new byte[is2.available()];
+                is2.read(buffer2); is2.close();
+                JSONObject json2 = new JSONObject(new String(buffer2, StandardCharsets.UTF_8));
+                Iterator<String> keys2 = json2.keys();
+                while (keys2.hasNext()) {
+                    String key = keys2.next();
+                    idToChar.put(Long.parseLong(key), json2.getString(key));
+                }
             }
 
             private void setupSeekBars() {
@@ -229,15 +282,16 @@ jobs:
 
             private void runInference(String text) {
                 try {
-                    // 使用新的分词器编码
-                    List<Integer> spIds = spProcessor.encodeNormalized(text, algorithm);
-                    int seqLen = spIds.size() + 2;
+                    int seqLen = text.length() + 2;
                     long[] inputData = new long[seqLen];
-                    inputData[0] = 1; // CLS (1 或视词表而定)
-                    for (int i = 0; i < spIds.size(); i++) {
-                        inputData[i + 1] = spIds.get(i);
+                    inputData[0] = clsId;
+                    
+                    // 单字匹配，和你原来的 Pro 版逻辑完全一致
+                    for (int i = 0; i < text.length(); i++) {
+                        String ch = String.valueOf(text.charAt(i));
+                        inputData[i + 1] = charToId.containsKey(ch) ? charToId.get(ch) : unkId;
                     }
-                    inputData[seqLen - 1] = 2; // SEP (2)
+                    inputData[seqLen - 1] = sepId;
 
                     long[] shape = new long[]{1, seqLen};
                     Tensor inputTensor = Tensor.fromBlob(inputData, shape);
@@ -247,7 +301,6 @@ jobs:
 
                     SpannableStringBuilder ssb = new SpannableStringBuilder();
                     
-                    // 跳过 CLS 和 SEP 遍历
                     for (int i = 1; i < seqLen - 1; i++) {
                         int origTokenId = (int) inputData[i];
                         int startIdx = i * vocabSize;
@@ -271,13 +324,11 @@ jobs:
                             if (prob > maxProb) { maxProb = prob; predTokenId = j; }
                         }
 
-                        // 还原文字 (过滤掉 SentencePiece 自带的下划线标记)
-                        String origChar = spProcessor.decodeSmart(Arrays.asList(origTokenId)).replace(" ", "").replace(" ", "");
+                        String origChar = String.valueOf(text.charAt(i - 1));
+                        String predChar = idToChar.containsKey((long) predTokenId) ? idToChar.get((long) predTokenId) : origChar;
                         
-                        if (predTokenId != origTokenId && maxProb >= threshold) {
-                            String predChar = spProcessor.decodeSmart(Arrays.asList(predTokenId)).replace(" ", "").replace(" ", "");
-                            
-                            // 灰字划线 (原始错误)
+                        if (predTokenId != origTokenId && maxProb >= threshold && !predChar.isEmpty() && !predChar.equals(origChar)) {
+                            // 灰字划线 (原始字)
                             int startGray = ssb.length();
                             ssb.append(origChar);
                             ssb.setSpan(new StrikethroughSpan(), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -313,7 +364,6 @@ jobs:
         }
         EOF
 
-        # 依然使用最稳定的 Gradle 7.5 配置，确保无懈可击
         wget -q https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar -O gradle/wrapper/gradle-wrapper.jar
         wget -q https://raw.githubusercontent.com/gradle/gradle/master/gradlew -O gradlew
         chmod +x gradlew
