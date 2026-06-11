@@ -19,52 +19,37 @@ jobs:
         java-version: '11'
         distribution: 'temurin'
 
-    - name: Download Model and Extract Vocab
+    - name: Download Model from Your Drive
       run: |
-        # 1. 安装下载工具和官方 sentencepiece 库
-        pip install gdown sentencepiece
-        
-        # 2. 下载你的云盘模型
-        gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
+        pipx run gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
         unzip -j -o model.zip
-        
-        # 3. 核心魔法：用 Python 把 spm.model 转成 Android 可直接读取的 JSON，丢弃麻烦的 C++ 库
-        cat << 'EOF' > convert_vocab.py
-        import sentencepiece as spm
-        import json
-        
-        sp = spm.SentencePieceProcessor(model_file='spm.model')
-        vocab = {}
-        id2char = {}
-        
-        for i in range(sp.get_piece_size()):
-            piece = sp.id_to_piece(i)
-            clean_piece = piece.replace(' ', '') # 移除 SPM 特有的下划线标记
-            
-            vocab[piece] = i
-            if clean_piece and clean_piece not in vocab:
-                vocab[clean_piece] = i
-                
-            id2char[i] = clean_piece if clean_piece else piece
-            
-        with open('vocab.json', 'w', encoding='utf-8') as f:
-            json.dump(vocab, f, ensure_ascii=False)
-        with open('id2char.json', 'w', encoding='utf-8') as f:
-            json.dump(id2char, f, ensure_ascii=False)
-        EOF
-        python convert_vocab.py
 
-    - name: Scaffold Android Project (Ultra Stable)
+    - name: Scaffold Android Project (with Python Engine)
       run: |
         mkdir -p app/src/main/java/com/example/csc
         mkdir -p app/src/main/res/layout
         mkdir -p app/src/main/assets
+        mkdir -p app/src/main/python
         mkdir -p gradle/wrapper
 
-        # 拷贝模型和我们刚生成的 JSON 词表到 assets
-        cp qideberta_csc_traced.pt app/src/main/assets/
-        cp vocab.json app/src/main/assets/
-        cp id2char.json app/src/main/assets/
+        # 拷贝你的模型文件到手机资源库
+        cp qideberta_csc_traced.pt app/src/main/assets/ || true
+        cp spm.model app/src/main/assets/ || true
+
+        # 【核心魔法】：直接在安卓里写 Python 脚本，原汁原味调用 SentencePiece！
+        cat << 'EOF' > app/src/main/python/sp_wrapper.py
+        import sentencepiece as spm
+
+        class SPM:
+            def __init__(self, model_path):
+                self.sp = spm.SentencePieceProcessor(model_file=model_path)
+            
+            def encode(self, text):
+                return self.sp.EncodeAsIds(text)
+                
+            def decode(self, ids):
+                return self.sp.DecodeIds(ids)
+        EOF
 
         cat << 'EOF' > gradle.properties
         android.useAndroidX=true
@@ -74,17 +59,27 @@ jobs:
 
         cat << 'EOF' > build.gradle
         buildscript {
-            repositories { google(); mavenCentral() }
-            dependencies { classpath "com.android.tools.build:gradle:7.4.2" }
+            repositories { 
+                google()
+                mavenCentral()
+                # 引入 Python 引擎源
+                maven { url "https://chaquo.com/maven" }
+            }
+            dependencies { 
+                classpath "com.android.tools.build:gradle:7.4.2" 
+                classpath "com.chaquo.python:gradle:14.0.2"
+            }
         }
-        // 彻底移除不可靠的第三方库，仅使用谷歌和 Maven 官方中央仓库
-        allprojects { repositories { google(); mavenCentral() } }
+        allprojects { repositories { google(); mavenCentral(); maven { url "https://chaquo.com/maven" } } }
         EOF
 
         echo "include ':app'" > settings.gradle
 
         cat << 'EOF' > app/build.gradle
-        apply plugin: 'com.android.application'
+        plugins {
+            id 'com.android.application'
+            id 'com.chaquo.python'
+        }
         android {
             namespace 'com.example.csc'
             compileSdk 33
@@ -95,20 +90,27 @@ jobs:
                 versionCode 1
                 versionName "1.0"
                 ndk { abiFilters "arm64-v8a" }
+                
+                // 在安卓打包时自动安装官方 Python 版 sentencepiece 依赖！
+                python {
+                    buildPython "python3"
+                    pip {
+                        install "sentencepiece"
+                    }
+                }
             }
             compileOptions {
                 sourceCompatibility JavaVersion.VERSION_11
                 targetCompatibility JavaVersion.VERSION_11
             }
             aaptOptions {
-                noCompress "pt"
+                noCompress "pt", "model"
             }
         }
         dependencies {
             implementation 'androidx.appcompat:appcompat:1.6.1'
             implementation 'com.google.android.material:material:1.8.0'
             implementation 'org.pytorch:pytorch_android_lite:1.13.0'
-            // 没有第三方分词库了，告别下载失败！
         }
         EOF
 
@@ -173,18 +175,16 @@ jobs:
         import android.widget.*;
         import org.pytorch.*;
         import java.io.*;
-        import java.nio.charset.StandardCharsets;
         import java.util.Locale;
-        import java.util.Map;
-        import java.util.HashMap;
-        import org.json.JSONObject;
-        import java.util.Iterator;
+
+        // 引入 Chaquopy (安卓上的 Python 引擎)
+        import com.chaquo.python.PyObject;
+        import com.chaquo.python.Python;
+        import com.chaquo.python.android.AndroidPlatform;
 
         public class MainActivity extends Activity {
             private Module module = null;
-            private Map<String, Long> charToId = new HashMap<>();
-            private Map<Long, String> idToChar = new HashMap<>();
-            private long clsId = 1, sepId = 2, unkId = 0;
+            private PyObject spProcessor = null;
             
             private EditText etInput;
             private Button btnCorrect;
@@ -210,17 +210,22 @@ jobs:
 
                 new Thread(() -> {
                     try {
+                        // 初始化 Python 环境
+                        if (!Python.isStarted()) {
+                            Python.start(new AndroidPlatform(this));
+                        }
+
+                        // 加载你 884MB 的 PyTorch 模型
                         String modelPath = assetFilePath(this, "qideberta_csc_traced.pt");
                         module = LiteModuleLoader.load(modelPath);
                         
-                        loadVocabMaps();
-                        
-                        clsId = charToId.containsKey("[CLS]") ? charToId.get("[CLS]") : charToId.getOrDefault("<s>", 1L);
-                        sepId = charToId.containsKey("[SEP]") ? charToId.get("[SEP]") : charToId.getOrDefault("</s>", 2L);
-                        unkId = charToId.containsKey("[UNK]") ? charToId.get("[UNK]") : charToId.getOrDefault("<unk>", 0L);
+                        // 用真实的 Python 跑你的 SentencePiece
+                        String spmPath = assetFilePath(this, "spm.model");
+                        PyObject pyModule = Python.getInstance().getModule("sp_wrapper");
+                        spProcessor = pyModule.callAttr("SPM", spmPath);
 
                         runOnUiThread(() -> {
-                            tvResult.setText("模型加载完毕，请输入文字！");
+                            tvResult.setText("模型与分词器加载完毕，请输入文字！");
                             Toast.makeText(MainActivity.this, "加载成功", Toast.LENGTH_SHORT).show();
                         });
                     } catch (Exception e) {
@@ -231,33 +236,9 @@ jobs:
 
                 btnCorrect.setOnClickListener(v -> {
                     String text = etInput.getText().toString();
-                    if (text.isEmpty() || module == null || charToId.isEmpty()) return;
+                    if (text.isEmpty() || module == null || spProcessor == null) return;
                     runInference(text);
                 });
-            }
-
-            private void loadVocabMaps() throws Exception {
-                // 读取 vocab.json
-                InputStream is = getAssets().open("vocab.json");
-                byte[] buffer = new byte[is.available()];
-                is.read(buffer); is.close();
-                JSONObject json = new JSONObject(new String(buffer, StandardCharsets.UTF_8));
-                Iterator<String> keys = json.keys();
-                while (keys.hasNext()) {
-                    String key = keys.next();
-                    charToId.put(key, (long) json.getInt(key));
-                }
-
-                // 读取 id2char.json
-                InputStream is2 = getAssets().open("id2char.json");
-                byte[] buffer2 = new byte[is2.available()];
-                is2.read(buffer2); is2.close();
-                JSONObject json2 = new JSONObject(new String(buffer2, StandardCharsets.UTF_8));
-                Iterator<String> keys2 = json2.keys();
-                while (keys2.hasNext()) {
-                    String key = keys2.next();
-                    idToChar.put(Long.parseLong(key), json2.getString(key));
-                }
             }
 
             private void setupSeekBars() {
@@ -282,17 +263,18 @@ jobs:
 
             private void runInference(String text) {
                 try {
-                    int seqLen = text.length() + 2;
-                    long[] inputData = new long[seqLen];
-                    inputData[0] = clsId;
+                    // 1. 调用内置的 Python 获取正确的 SentencePiece 分词
+                    int[] spIds = spProcessor.callAttr("encode", text).toJava(int[].class);
                     
-                    // 单字匹配，和你原来的 Pro 版逻辑完全一致
-                    for (int i = 0; i < text.length(); i++) {
-                        String ch = String.valueOf(text.charAt(i));
-                        inputData[i + 1] = charToId.containsKey(ch) ? charToId.get(ch) : unkId;
+                    int seqLen = spIds.length + 2;
+                    long[] inputData = new long[seqLen];
+                    inputData[0] = 1; // [CLS]
+                    for (int i = 0; i < spIds.length; i++) {
+                        inputData[i + 1] = spIds[i];
                     }
-                    inputData[seqLen - 1] = sepId;
+                    inputData[seqLen - 1] = 2; // [SEP]
 
+                    // 2. PyTorch 模型推理
                     long[] shape = new long[]{1, seqLen};
                     Tensor inputTensor = Tensor.fromBlob(inputData, shape);
                     Tensor outputTensor = module.forward(IValue.from(inputTensor)).toTensor();
@@ -301,6 +283,7 @@ jobs:
 
                     SpannableStringBuilder ssb = new SpannableStringBuilder();
                     
+                    // 3. 解码并上色
                     for (int i = 1; i < seqLen - 1; i++) {
                         int origTokenId = (int) inputData[i];
                         int startIdx = i * vocabSize;
@@ -324,21 +307,25 @@ jobs:
                             if (prob > maxProb) { maxProb = prob; predTokenId = j; }
                         }
 
-                        String origChar = String.valueOf(text.charAt(i - 1));
-                        String predChar = idToChar.containsKey((long) predTokenId) ? idToChar.get((long) predTokenId) : origChar;
+                        // 用 Python 把 ID 解码回文字
+                        String origChar = spProcessor.callAttr("decode", new int[]{origTokenId}).toString().replace(" ", "").replace(" ", "");
                         
-                        if (predTokenId != origTokenId && maxProb >= threshold && !predChar.isEmpty() && !predChar.equals(origChar)) {
-                            // 灰字划线 (原始字)
-                            int startGray = ssb.length();
-                            ssb.append(origChar);
-                            ssb.setSpan(new StrikethroughSpan(), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-                            ssb.setSpan(new ForegroundColorSpan(Color.GRAY), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        if (predTokenId != origTokenId && maxProb >= threshold) {
+                            String predChar = spProcessor.callAttr("decode", new int[]{predTokenId}).toString().replace(" ", "").replace(" ", "");
+                            
+                            if (!predChar.isEmpty() && !predChar.equals(origChar)) {
+                                int startGray = ssb.length();
+                                ssb.append(origChar);
+                                ssb.setSpan(new StrikethroughSpan(), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                ssb.setSpan(new ForegroundColorSpan(Color.GRAY), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
 
-                            // 红字修正 (附带置信度)
-                            int startRed = ssb.length();
-                            String confStr = String.format(Locale.getDefault(), "%.2f", maxProb);
-                            ssb.append(predChar).append("(").append(confStr).append(")");
-                            ssb.setSpan(new ForegroundColorSpan(Color.RED), startRed, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                int startRed = ssb.length();
+                                String confStr = String.format(Locale.getDefault(), "%.2f", maxProb);
+                                ssb.append(predChar).append("(").append(confStr).append(")");
+                                ssb.setSpan(new ForegroundColorSpan(Color.RED), startRed, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            } else {
+                                ssb.append(origChar);
+                            }
                         } else {
                             ssb.append(origChar);
                         }
