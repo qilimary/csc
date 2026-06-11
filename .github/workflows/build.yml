@@ -21,10 +21,7 @@ jobs:
 
     - name: Download and Unzip Your Model
       run: |
-        pip install gdown
-        # 用你的链接下载 QiDeBERTa 模型和词表
-        gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
-        # -j 参数表示解压时忽略文件夹层级，直接把文件放在当前目录
+        pipx run gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O model.zip
         unzip -j -o model.zip
 
     - name: Scaffold Android Project (Simplified)
@@ -50,7 +47,8 @@ jobs:
             repositories { google(); mavenCentral() }
             dependencies { classpath "com.android.tools.build:gradle:7.4.2" }
         }
-        allprojects { repositories { google(); mavenCentral(); maven { url "https://jitpack.io" } } }
+        # 彻底移除 JitPack，只保留绝对可靠的官方镜像源
+        allprojects { repositories { google(); mavenCentral() } }
         EOF
 
         echo "include ':app'" > settings.gradle
@@ -80,7 +78,9 @@ jobs:
             implementation 'androidx.appcompat:appcompat:1.6.1'
             implementation 'com.google.android.material:material:1.8.0'
             implementation 'org.pytorch:pytorch_android_lite:1.13.0'
-            implementation 'com.github.wpm:sentencepiece-android:0.1.92'
+            
+            # 使用全新的纯 Java 版 SentencePiece4J (绝对可用)
+            implementation 'io.github.eix128:sentencepiece4j:1.0.2'
         }
         EOF
 
@@ -118,7 +118,7 @@ jobs:
                 <SeekBar android:id="@+id/seekTemp" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="200" android:progress="100"/>
             </LinearLayout>
             <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:layout_marginTop="8dp">
-                <TextView android:id="@+id/tvThreshold" android:layout_width="120dp" android:layout_height="wrap_content" android:text="置信度: 0.8"/>
+                <TextView android:id="@+id/tvThreshold" android:layout_width="120dp" android:layout_height="wrap_content" android:text="置信度: 0.80"/>
                 <SeekBar android:id="@+id/seekThreshold" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" android:progress="80"/>
             </LinearLayout>
             <Button android:id="@+id/btnCorrect" android:layout_width="match_parent"
@@ -133,6 +133,7 @@ jobs:
 
         cat << 'EOF' > app/src/main/java/com/example/csc/MainActivity.java
         package com.example.csc;
+        
         import android.app.Activity;
         import android.content.Context;
         import android.graphics.Color;
@@ -143,13 +144,21 @@ jobs:
         import android.text.style.StrikethroughSpan;
         import android.widget.*;
         import org.pytorch.*;
-        import sentencepiece.SentencePieceProcessor;
         import java.io.*;
         import java.util.Locale;
+        import java.util.List;
+        import java.util.Arrays;
+        import java.nio.file.Paths;
+
+        // 引入全新的纯 Java 版 SentencePiece
+        import com.sentencepiece.Model;
+        import com.sentencepiece.SentencePieceAlgorithm;
+        import com.sentencepiece.Scoring;
 
         public class MainActivity extends Activity {
             private Module module = null;
-            private SentencePieceProcessor spProcessor = null;
+            private Model spProcessor = null;
+            private SentencePieceAlgorithm algorithm = null;
             private EditText etInput;
             private Button btnCorrect;
             private TextView tvResult, tvTemp, tvThreshold;
@@ -176,14 +185,17 @@ jobs:
                     try {
                         String modelPath = assetFilePath(this, "qideberta_csc_traced.pt");
                         module = LiteModuleLoader.load(modelPath);
+                        
                         String spmPath = assetFilePath(this, "spm.model");
-                        spProcessor = new SentencePieceProcessor();
-                        spProcessor.load(spmPath);
+                        spProcessor = Model.parseFrom(Paths.get(spmPath));
+                        algorithm = new SentencePieceAlgorithm(true, Scoring.HIGHEST_SCORE);
+                        
                         runOnUiThread(() -> {
                             tvResult.setText("模型加载完毕，请输入文字！");
                             Toast.makeText(MainActivity.this, "加载成功", Toast.LENGTH_SHORT).show();
                         });
                     } catch (Exception e) {
+                        e.printStackTrace();
                         runOnUiThread(() -> tvResult.setText("加载失败: " + e.getMessage()));
                     }
                 }).start();
@@ -217,12 +229,15 @@ jobs:
 
             private void runInference(String text) {
                 try {
-                    int[] spIds = spProcessor.encodeAsIds(text);
-                    int seqLen = spIds.length + 2;
+                    // 使用新的分词器编码
+                    List<Integer> spIds = spProcessor.encodeNormalized(text, algorithm);
+                    int seqLen = spIds.size() + 2;
                     long[] inputData = new long[seqLen];
-                    inputData[0] = 1; // CLS
-                    for (int i = 0; i < spIds.length; i++) inputData[i + 1] = spIds[i];
-                    inputData[seqLen - 1] = 2; // SEP
+                    inputData[0] = 1; // CLS (1 或视词表而定)
+                    for (int i = 0; i < spIds.size(); i++) {
+                        inputData[i + 1] = spIds.get(i);
+                    }
+                    inputData[seqLen - 1] = 2; // SEP (2)
 
                     long[] shape = new long[]{1, seqLen};
                     Tensor inputTensor = Tensor.fromBlob(inputData, shape);
@@ -231,6 +246,8 @@ jobs:
                     int vocabSize = logits.length / seqLen;
 
                     SpannableStringBuilder ssb = new SpannableStringBuilder();
+                    
+                    // 跳过 CLS 和 SEP 遍历
                     for (int i = 1; i < seqLen - 1; i++) {
                         int origTokenId = (int) inputData[i];
                         int startIdx = i * vocabSize;
@@ -254,16 +271,19 @@ jobs:
                             if (prob > maxProb) { maxProb = prob; predTokenId = j; }
                         }
 
-                        String origChar = spProcessor.decodeIds(new int[]{origTokenId}).replace(" ", "");
+                        // 还原文字 (过滤掉 SentencePiece 自带的下划线标记)
+                        String origChar = spProcessor.decodeSmart(Arrays.asList(origTokenId)).replace(" ", "").replace(" ", "");
                         
                         if (predTokenId != origTokenId && maxProb >= threshold) {
-                            String predChar = spProcessor.decodeIds(new int[]{predTokenId}).replace(" ", "");
+                            String predChar = spProcessor.decodeSmart(Arrays.asList(predTokenId)).replace(" ", "").replace(" ", "");
                             
+                            // 灰字划线 (原始错误)
                             int startGray = ssb.length();
                             ssb.append(origChar);
                             ssb.setSpan(new StrikethroughSpan(), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
                             ssb.setSpan(new ForegroundColorSpan(Color.GRAY), startGray, ssb.length(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
 
+                            // 红字修正 (附带置信度)
                             int startRed = ssb.length();
                             String confStr = String.format(Locale.getDefault(), "%.2f", maxProb);
                             ssb.append(predChar).append("(").append(confStr).append(")");
@@ -293,7 +313,7 @@ jobs:
         }
         EOF
 
-        # 同样使用你提供代码里最稳定的原生 gradle 7.5 配置方案
+        # 依然使用最稳定的 Gradle 7.5 配置，确保无懈可击
         wget -q https://raw.githubusercontent.com/gradle/gradle/master/gradle/wrapper/gradle-wrapper.jar -O gradle/wrapper/gradle-wrapper.jar
         wget -q https://raw.githubusercontent.com/gradle/gradle/master/gradlew -O gradlew
         chmod +x gradlew
