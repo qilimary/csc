@@ -1,0 +1,311 @@
+name: Build Android App on Cloud
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Generate Android Project Code
+      run: |
+        mkdir -p app/src/main/java/com/example/csc
+        mkdir -p app/src/main/res/layout
+        mkdir -p app/src/main/res/values
+        mkdir -p app/src/main/assets
+        
+        cat << 'EOF' > settings.gradle.kts
+        pluginManagement {
+            repositories {
+                google()
+                mavenCentral()
+                gradlePluginPortal()
+            }
+        }
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories {
+                google()
+                mavenCentral()
+                maven { url = uri("https://jitpack.io") }
+            }
+        }
+        rootProject.name = "CSCChecker"
+        include(":app")
+        EOF
+        
+        cat << 'EOF' > build.gradle.kts
+        buildscript {
+            repositories {
+                google()
+                mavenCentral()
+            }
+            dependencies {
+                classpath("com.android.tools.build:gradle:8.1.1")
+                classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.0")
+            }
+        }
+        EOF
+        
+        cat << 'EOF' > app/build.gradle.kts
+        plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+        }
+        
+        android {
+            namespace = "com.example.csc"
+            compileSdk = 34
+            defaultConfig {
+                applicationId = "com.example.csc"
+                minSdk = 26
+                targetSdk = 34
+                versionCode = 1
+                versionName = "1.0"
+                ndk { abiFilters.add("arm64-v8a") }
+            }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_1_8
+                targetCompatibility = JavaVersion.VERSION_1_8
+            }
+            kotlinOptions { jvmTarget = "1.8" }
+            androidResources {
+                noCompress.add("pt")
+                noCompress.add("model")
+            }
+        }
+        
+        dependencies {
+            implementation("androidx.core:core-ktx:1.12.0")
+            implementation("androidx.appcompat:appcompat:1.6.1")
+            implementation("com.google.android.material:material:1.11.0")
+            implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+            implementation("org.pytorch:pytorch_android_lite:1.13.0")
+            implementation("org.pytorch:pytorch_android_torchvision_lite:1.13.0")
+            implementation("com.github.wpm:sentencepiece-android:0.1.92")
+        }
+        EOF
+        
+        cat << 'EOF' > app/src/main/AndroidManifest.xml
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:allowBackup="true"
+                android:label="中文纠错(云端版)"
+                android:supportsRtl="true"
+                android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                <activity android:name=".MainActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+        
+        cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+        <?xml version="1.0" encoding="utf-8"?>
+        <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:orientation="vertical" android:padding="16dp">
+            <EditText android:id="@+id/etInput" android:layout_width="match_parent"
+                android:layout_height="150dp" android:hint="请输入中文文本..."
+                android:gravity="top|start" android:background="#1A000000"
+                android:padding="10dp" android:textSize="18sp"/>
+            <TextView android:id="@+id/tvTemp" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:layout_marginTop="16dp"
+                android:text="温度 (Temperature): 1.0"/>
+            <SeekBar android:id="@+id/seekTemp" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:max="200" android:progress="100"/>
+            <TextView android:id="@+id/tvThreshold" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:layout_marginTop="10dp"
+                android:text="置信度阈值: 0.8"/>
+            <SeekBar android:id="@+id/seekThreshold" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:max="100" android:progress="80"/>
+            <Button android:id="@+id/btnCorrect" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="开始纠错"/>
+            <ScrollView android:layout_width="match_parent" android:layout_height="match_parent" android:layout_marginTop="16dp">
+                <TextView android:id="@+id/tvResult" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:text="请等待模型加载..."
+                    android:textSize="18sp" android:lineSpacingExtra="8dp"/>
+            </ScrollView>
+        </LinearLayout>
+        EOF
+        
+        cat << 'EOF' > app/src/main/java/com/example/csc/MainActivity.kt
+        package com.example.csc
+        import android.content.Context
+        import android.graphics.Color
+        import android.os.Bundle
+        import android.text.Spannable
+        import android.text.SpannableStringBuilder
+        import android.text.style.ForegroundColorSpan
+        import android.text.style.StrikethroughSpan
+        import android.widget.*
+        import androidx.appcompat.app.AppCompatActivity
+        import org.pytorch.*
+        import sentencepiece.SentencePieceProcessor
+        import java.io.*
+        import kotlin.math.exp
+        class MainActivity : AppCompatActivity() {
+            private var module: Module? = null
+            private var spProcessor: SentencePieceProcessor? = null
+            private lateinit var etInput: EditText
+            private lateinit var btnCorrect: Button
+            private lateinit var tvResult: TextView
+            private lateinit var tvTemp: TextView
+            private lateinit var seekTemp: SeekBar
+            private lateinit var tvThreshold: TextView
+            private lateinit var seekThreshold: SeekBar
+            private var temperature = 1.0f
+            private var threshold = 0.8f
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                setContentView(R.layout.activity_main)
+                etInput = findViewById(R.id.etInput)
+                btnCorrect = findViewById(R.id.btnCorrect)
+                tvResult = findViewById(R.id.tvResult)
+                tvTemp = findViewById(R.id.tvTemp)
+                seekTemp = findViewById(R.id.seekTemp)
+                tvThreshold = findViewById(R.id.tvThreshold)
+                seekThreshold = findViewById(R.id.seekThreshold)
+                setupSeekBars()
+                Thread {
+                    try {
+                        val modelPath = assetFilePath(this, "qideberta_csc_traced.pt")
+                        module = LiteModuleLoader.load(modelPath)
+                        val spmPath = assetFilePath(this, "spm.model")
+                        spProcessor = SentencePieceProcessor()
+                        spProcessor!!.load(spmPath)
+                        runOnUiThread {
+                            Toast.makeText(this, "模型加载成功！", Toast.LENGTH_SHORT).show()
+                            tvResult.text = "加载完毕，请输入需要纠错的文字。"
+                        }
+                    } catch (e: Exception) {
+                        runOnUiThread { tvResult.text = "加载失败: " + e.message }
+                    }
+                }.start()
+                btnCorrect.setOnClickListener {
+                    val text = etInput.text.toString()
+                    if (text.isEmpty() || module == null || spProcessor == null) return@setOnClickListener
+                    runInference(text)
+                }
+            }
+            private fun setupSeekBars() {
+                seekTemp.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        temperature = progress / 100f
+                        if (temperature < 0.1f) temperature = 0.1f
+                        tvTemp.text = "温度: $temperature"
+                    }
+                    override fun onStartTrackingTouch(p0: SeekBar?) {}
+                    override fun onStopTrackingTouch(p0: SeekBar?) {}
+                })
+                seekThreshold.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        threshold = progress / 100f
+                        tvThreshold.text = "置信度阈值: $threshold"
+                    }
+                    override fun onStartTrackingTouch(p0: SeekBar?) {}
+                    override fun onStopTrackingTouch(p0: SeekBar?) {}
+                })
+            }
+            private fun runInference(inputText: String) {
+                try {
+                    val tokenIds = spProcessor!!.encodeAsIds(inputText).toMutableList()
+                    tokenIds.add(0, 1) // CLS
+                    tokenIds.add(2)    // SEP
+                    val shape = longArrayOf(1, tokenIds.size.toLong())
+                    val inputTensor = Tensor.fromBlob(tokenIds.map { it.toLong() }.toLongArray(), shape)
+                    val outputTensor = module!!.forward(IValue.from(inputTensor)).toTensor()
+                    val logits = outputTensor.dataAsFloatArray
+                    val vocabSize = logits.size / tokenIds.size
+                    val ssb = SpannableStringBuilder()
+                    for (i in 1 until tokenIds.size - 1) {
+                        val origTokenId = tokenIds[i]
+                        val startIdx = i * vocabSize
+                        val tokenLogits = logits.copyOfRange(startIdx, startIdx + vocabSize)
+                        val pair = applyTemperatureAndSoftmax(tokenLogits, temperature)
+                        val predTokenId = pair.first
+                        val maxProb = pair.second
+                        val origChar = spProcessor!!.decodeIds(intArrayOf(origTokenId)).replace(" ", "")
+                        if (predTokenId != origTokenId && maxProb >= threshold) {
+                            val predChar = spProcessor!!.decodeIds(intArrayOf(predTokenId)).replace(" ", "")
+                            val startGray = ssb.length
+                            ssb.append(origChar)
+                            ssb.setSpan(StrikethroughSpan(), startGray, ssb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                            ssb.setSpan(ForegroundColorSpan(Color.GRAY), startGray, ssb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                            val startRed = ssb.length
+                            val confStr = String.format("%.2f", maxProb)
+                            ssb.append(predChar).append("(").append(confStr).append(")")
+                            ssb.setSpan(ForegroundColorSpan(Color.RED), startRed, ssb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                        } else {
+                            ssb.append(origChar)
+                        }
+                    }
+                    tvResult.text = ssb
+                } catch (e: Exception) {
+                    tvResult.text = "推理错误: " + e.message
+                }
+            }
+            private fun applyTemperatureAndSoftmax(logits: FloatArray, temp: Float): Pair<Int, Float> {
+                var maxLogit = logits[0]
+                for (v in logits) if (v > maxLogit) maxLogit = v
+                var sumExp = 0f
+                val exps = FloatArray(logits.size)
+                for (i in logits.indices) {
+                    exps[i] = exp((logits[i] - maxLogit) / temp)
+                    sumExp += exps[i]
+                }
+                var maxProb = 0f; var bestId = 0
+                for (i in exps.indices) {
+                    val prob = exps[i] / sumExp
+                    if (prob > maxProb) { maxProb = prob; bestId = i }
+                }
+                return Pair(bestId, maxProb)
+            }
+            private fun assetFilePath(context: Context, assetName: String): String {
+                val file = File(context.filesDir, assetName)
+                if (file.exists() && file.length() > 0) return file.absolutePath
+                context.assets.open(assetName).use { inputStream ->
+                    FileOutputStream(file).use { outputStream ->
+                        val buffer = ByteArray(4 * 1024)
+                        var read: Int
+                        while (inputStream.read(buffer).also { read = it } != -1) {
+                            outputStream.write(buffer, 0, read)
+                        }
+                        outputStream.flush()
+                    }
+                }
+                return file.absolutePath
+            }
+        }
+        EOF
+
+    - name: Download Model from Google Drive
+      run: |
+        pip install gdown
+        gdown "1YjFdJcVkHOwfLV6j7iwQCctdTpLz_NPt" -O app/src/main/assets/model.zip
+        unzip -j app/src/main/assets/model.zip -d app/src/main/assets/
+        rm app/src/main/assets/model.zip
+
+    - name: Build APK (Compiling App)
+      run: |
+        gradle wrapper --gradle-version 8.2
+        ./gradlew assembleDebug --no-daemon
+
+    - name: Upload Finished APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: CSCChecker-App
+        path: app/build/outputs/apk/debug/app-debug.apk
