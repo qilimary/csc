@@ -48,7 +48,7 @@ jobs:
                 return self.sp.EncodeAsIds(text)
                 
             def decode(self, ids):
-                return self.sp.DecodeIds(ids)
+                return self.sp.DecodeIds([int(x) for x in ids])
         EOF
 
         cat << 'EOF' > gradle.properties
@@ -62,7 +62,7 @@ jobs:
             repositories { 
                 google()
                 mavenCentral()
-                # 引入 Python 引擎源
+                // 引入 Python 引擎源 (已修复之前的符号错误)
                 maven { url "https://chaquo.com/maven" }
             }
             dependencies { 
@@ -212,15 +212,15 @@ jobs:
                     try {
                         // 初始化 Python 环境
                         if (!Python.isStarted()) {
-                            Python.start(new AndroidPlatform(this));
+                            Python.start(new AndroidPlatform(MainActivity.this));
                         }
 
                         // 加载你 884MB 的 PyTorch 模型
-                        String modelPath = assetFilePath(this, "qideberta_csc_traced.pt");
+                        String modelPath = assetFilePath(MainActivity.this, "qideberta_csc_traced.pt");
                         module = LiteModuleLoader.load(modelPath);
                         
                         // 用真实的 Python 跑你的 SentencePiece
-                        String spmPath = assetFilePath(this, "spm.model");
+                        String spmPath = assetFilePath(MainActivity.this, "spm.model");
                         PyObject pyModule = Python.getInstance().getModule("sp_wrapper");
                         spProcessor = pyModule.callAttr("SPM", spmPath);
 
@@ -268,6 +268,8 @@ jobs:
                     
                     int seqLen = spIds.length + 2;
                     long[] inputData = new long[seqLen];
+                    
+                    // 注意：DeBERTa 经常用 1 做 CLS，2 做 SEP，这基于你的特殊词表。
                     inputData[0] = 1; // [CLS]
                     for (int i = 0; i < spIds.length; i++) {
                         inputData[i + 1] = spIds[i];
